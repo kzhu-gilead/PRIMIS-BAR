@@ -1,0 +1,610 @@
+---
+title: "Biomarker analysis of GS-US-428-4194 (PRIMIS)"
+subtitle: "A Phase 3, randomized, double-blinded, placebo-controlled study evaluating the safety, tolerability, and efficacy of Cilofexor in non-cirrhotic subjects with primary sclerosing cholangitis"
+author: 
+  - Kaiyi Zhu^[Department of Clinical Bioinformatics & Exploratory Analytics, kaiyi.zhu1@gilead.com]
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+<br>
+
+# Background 
+
+- Primary sclerosing cholangitis (PSC) is a chronic progressive cholestatic liver disease with a poorly understood pathogenesis
+
+- There are no approved therapies that can improve clinical outcomes in patients with PSC
+
+- Cilofexor (CILO) is a selective, nonsteroidal farnesoid X receptor agonist
+
+- [A phase 2 trial](https://doi.org/10.1002/hep.30509) in patients with non-cirrhotic PSC showed that treatment with CILO led to significant improvements in liver biochemistries and markers of cholestasis, and was well tolerated
+
+- [PRIMIS](https://doi.org/10.1186/s12876-023-02653-2) is a phase 3, double-blind, randomized, placebo-controlled, multi-center trial (NCT03890120) designed to assess the efficacy and safety of CILO for the treatment of non-cirrhotic PSC
+
+<br>
+<br>
+
+# Data preprocessing
+
+## Load required packages
+
+```{r}
+library(haven)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(pROC)
+library(gtsummary)
+library(lsmeans)
+
+```
+
+
+## Incorporate relevant information from ADSL and ADLB
+
+```{r}
+ADSL_PATH <- '/biometrics_prod/projects/p428/s4284194/biomarker/final/version2/adamdata/adsl.sas7bdat'
+ADLB_PATH <- '/biometrics_prod/projects/p428/s4284194/biomarker/final/version2/adamdata/adlb.sas7bdat'
+ADBK_PATH = '/biometrics_prod/projects/p428/s4284194/biomarker/final/version2/adamdata/adbk.sas7bdat'
+```
+
+```{r}
+adsl <- read_sas(ADSL_PATH)
+
+adlb <- read_sas(ADLB_PATH) %>%
+  filter(ANL01FL == 'Y')
+
+adbk <- read_sas(ADBK_PATH) %>%
+  filter(ANL01FL == 'Y') %>%
+  left_join(., select(adsl, USUBJID, IBD, BUDCA, BLUDWIG, BBMI, FUTILFL)) %>%
+  left_join(., select(adlb, USUBJID, TRT01A, AVISIT, PARAMCD, ANRHI, R2ANRHI)) %>%
+  mutate(BLUDWIG_CAT = factor(ifelse(BLUDWIG < 3, 'F0-2', 'F3'))) %>%
+  mutate(BLUDWIG = paste0('F', BLUDWIG)) %>%
+  mutate(TRT01A = factor(str_replace(TRT01A, ' 100 mg', ''), 
+                         levels = c('Placebo', 'CILO'), ordered = TRUE)) %>%
+  mutate(PARAMCD = ifelse(PARAMCD == 'CHA', 'CA',
+                          ifelse(PARAMCD == 'GUCDA', 'GUDCA', 
+                                 ifelse(PARAMCD == 'TUCDA', 'TUDCA', PARAMCD))))
+
+```
+
+## Group biomarkers into categories
+
+```{r}
+histology <- c('LUDWFBS', 
+               'ALPHASMA', 'COLLAGEN',
+               'BIDULCK7', 'DUCRCK7', 'PRDUCFBS')
+
+PD <- c('C4', 'FGF19')
+
+inflammation <- c('CRP', 'CALPRO')
+
+NIT_fibrosis <- c('APRI', 'FIB4', 'FIBSCAN', 
+                  'ELFSCORE', 'P3NP', 'HYALUAC', 'TIMP1')
+
+liver_biochemistry <- c('ALT', 'AST', 'GGT', 'ALP', 'BILI', 'ALB', 
+                        'CK18M30', 'CK18M65')
+
+BA = list(
+  'Primary' = c('CA', 'CDCA'),
+  'Conjugated Primary' = c('GCA', 'TCA', 'GCDCA', 'TCDCA'),
+  'Secondary' = c('DCA', 'LCA', 'UDCA'),
+  'Conjugated Secondary' = c('GDCA', 'TDCA', 'GLCA', 'TLCA', 'GUDCA', 'TUDCA'),
+  'Total' = c('METATBA', 'TBMUDCA', 'PRMTBA', 'SBMUDCA')
+)
+
+BA_derived <- c('METATBA', 'SECTBA', 'PRMTBA', 'CONJTBA', 'UNCNTBA',
+                'SBMUDCA', 'TBMUDCA',
+                'CA2CDCA', 'LTH2TBA', 'PRM2SEC', 'PRM2TBA', 'SEC2TBA')   
+
+```
+
+<br>
+<br>
+
+# Baseline analysis
+
+```{r}
+adbk_BL <- adbk %>%
+  filter(AVISIT == 'Baseline') 
+```
+
+## Pairwise correlations between all biomarkers 
+
+```{r}
+## Function of clustering correlation matrix
+reorder_cormat <- function(cormat){
+  dd <- as.dist((1-cormat)/2)
+  hc <- hclust(dd, method = 'ward.D2')
+  cormat <- cormat[hc$order, hc$order]
+}
+```
+
+```{r}
+## Prepare the data frame to calculate correlation
+df_all <- adbk_BL %>%
+  filter(PARAMCD %in% c(# 'LUDWFBS',
+                        NIT_fibrosis[1:4], 
+                        # unlist(BA[1:4]),
+                        unlist(BA[5])[-1],
+                        inflammation,
+                        PD, 
+                        liver_biochemistry)) %>%
+  select(USUBJID, PARAMCD, AVAL) %>%
+  distinct() %>%
+  pivot_wider(values_from = AVAL, names_from = PARAMCD) %>%
+  column_to_rownames('USUBJID')
+
+colnames(df_all)[c(17:19)] <- c('Primary BA', 'Secondary BA', 'Total BA')
+```
+
+```{r}
+df_ludwig <- adbk_BL %>%
+  filter(PARAMCD == 'LUDWFBS') %>%
+  select(USUBJID, AVAL) %>%
+  rename(FibrosisStage = AVAL) %>%
+  distinct() %>%
+  column_to_rownames('USUBJID')
+
+cor_ludwig <- matrix(NA, nrow = ncol(df_all), ncol = 3,
+                     dimnames = list(c(PD, liver_biochemistry, NIT_fibrosis[1:4], 'Total BA', 'Primary BA', 'Secondary BA', inflammation),
+                                     c('rho', 'p.value', 'group')))
+for (i in rownames(cor_ludwig)) {
+  
+  res <- cor.test(df_all[,i], df_ludwig$FibrosisStage, method = 'spearman')
+  cor_ludwig[i, "rho"] <- res$estimate
+  cor_ludwig[i, "p.value"] <- res$p.value
+  
+}
+cor_ludwig <- as.data.frame(cor_ludwig)
+cor_ludwig$biomarker <- factor(rownames(cor_ludwig), 
+                               levels = c(PD, liver_biochemistry, NIT_fibrosis[1:4], 'Total BA', 'Primary BA', 'Secondary BA', inflammation), ordered = TRUE)
+cor_ludwig$clinical <- 'Ludwig Fibrosis Stage'
+cor_ludwig$group <- c(rep('PD', length(PD)), rep('Liver injury', length(liver_biochemistry)), rep('Fibrosis NITs', 4),
+                      rep('Bile Acids', length = 3), rep('Inflam', length(inflammation)))
+cor_ludwig$group <- factor(cor_ludwig$group, 
+                           levels = c('PD', 'Liver injury', 'Fibrosis NITs', 'Bile Acids', 'Inflam'), ordered = TRUE)
+cor_ludwig$p.adj <- p.adjust(cor_ludwig[, 'p.value'], method = 'bonferroni')
+cor_ludwig$star <- cut(cor_ludwig$p.adj, breaks = c(-Inf, c(0.0001, 0.001, 0.01), 1), 
+            labels = c('***', '**', '*', ''))
+```
+
+```{r, fig.width=7.5, fig.height=1.5}
+ggplot(cor_ludwig, aes(x = biomarker, y = clinical, fill = rho)) +
+  facet_grid(cols = vars(group), scales= "free", space = 'free') +
+  geom_tile(color = 'black') +
+  scale_fill_gradient2(low = 'blue', high = 'red', mid = 'white', 
+                       midpoint = 0, limit = c(-1,1), space = 'Lab') +
+  geom_text(aes(label = star), color = 'black', size = 2.5)+ 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        axis.title = element_blank(),
+        # panel.border = element_blank(),
+        strip.text = element_text(family = "Arial", size = 10, face = "bold"),
+        legend.position = 'none',
+        panel.spacing.x = unit(0, "lines")
+        )
+
+```
+
+
+```{r}
+## Calculate pairwise Spearman correlation
+cormat <- round(cor(df_all, use = 'na.or.complete', method = 'spearman'), 2)
+cormat <- reorder_cormat(cormat)
+# cormat[lower.tri(cormat,diag = FALSE)] <- NA
+melted_cormat <- melt(cormat, na.rm = TRUE)
+melted_cormat$Var1 <- factor(melted_cormat$Var1, 
+                             levels = c(PD, liver_biochemistry, NIT_fibrosis[1:4], 'Total BA', 'Primary BA', 'Secondary BA', inflammation),
+                             ordered = TRUE)
+melted_cormat$Var2 <- factor(melted_cormat$Var2, 
+                             levels = c(PD, liver_biochemistry, NIT_fibrosis[1:4], 'Total BA', 'Primary BA', 'Secondary BA', inflammation),
+                             ordered = TRUE)
+
+pvalues <- rep(NA, length = nrow(melted_cormat))
+coef <- rep(NA, length = nrow(melted_cormat))
+for (i in 1:nrow(melted_cormat)) {
+  
+  if(is.na(melted_cormat$value[i]))
+    next
+  else{
+    res <- cor.test(df_all[, as.character(melted_cormat$Var1)[i]], 
+                    df_all[, as.character(melted_cormat$Var2)[i]],
+                    method = 'spearman')
+    pvalues[i] <- res$p.value
+    coef[i] <- res$estimate
+  }
+  
+}
+
+## Correct P-values by Bonferroni for multiple testing
+bonf_divider = (ncol(df_all) * (ncol(df_all)-1))/2
+star <- cut(pvalues, breaks = c(-Inf, c(0.0001, 0.001, 0.01)/bonf_divider, 1), 
+            labels = c('***', '**', '*', ''))
+melted_cormat$star = star
+melted_cormat$star[which(melted_cormat$rho == 1)] = ''
+melted_cormat$rho = round(coef, digits = 2)
+```
+
+```{r, fig.width=7.5, fig.height=7}
+## Heatmap showing the correlation
+ggplot(melted_cormat, aes(Var2, Var1, fill = rho)) +
+  geom_tile(color = 'black') +
+  scale_fill_gradient2(low = 'blue', high = 'red', mid = 'white', 
+                       midpoint = 0, limit = c(-1,1), space = 'Lab',
+                       name = 'Spearman\nCorrelation') +
+  geom_text(aes(Var2, Var1, label = star), color = 'black', size = 2.5) +
+  # geom_text(aes(Var2, Var1, label = rho), color = 'black', size = 2.5) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+         axis.title = element_blank(),
+        panel.border = element_blank()
+        ) +
+  coord_fixed()
+
+```
+
+- Ludwig fibrosis stage is positively associated with noninvasive fibrosis tests (FibroScan, ELF, APRI), liver biochemistry, and conjugated primary bile acids
+
+- Most negative correlation was between C4 and FGF19 (rho = -0.47)
+
+<br>
+
+## Biomarker association with Ludwig fibrosis stages
+
+Same functions can also be used for evaluating association with other categorical features (e.g. UDCA use, IBD)
+
+```{r, fig.width=5.5, fig.height=5.5}
+df <- adbk_BL %>%
+  select(USUBJID, TRT01A, RACE, AGE, SEX, BBMI, IBD, BUDCA, BLUDWIG, BLUDWIG_CAT, PARAMCD, AVAL) %>%
+  distinct() 
+
+## You can specify the biomarker of interest
+biomarker <- 'ELFSCORE'
+df_plot <- df %>%
+  filter(PARAMCD == biomarker)
+
+## P values were derived by Wilcoxon Rank Sum test
+wilcox.test(df_plot$AVAL ~ df_plot$BLUDWIG_CAT)
+
+## Calculate AUROC of biomarker BL values as the effect size
+roc <- roc(df_plot$BLUDWIG_CAT, df_plot$AVAL,
+           levels = c('F0-2', 'F3'),
+           grid= TRUE,
+           ci = TRUE, ci.alpha = 0.95,
+           plot = TRUE, print.auc = TRUE)
+```
+
+```{r, fig.width=4, fig.height=4}
+## Boxplot
+# As for FibroScan, log-transformation of y-axis may be considered
+ggplot(df_plot, aes(x = BLUDWIG_CAT, y = AVAL, fill = BLUDWIG_CAT)) +
+  stat_boxplot(geom = 'errorbar', width = 0.3) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_brewer(palette = 'Paired') +
+  geom_jitter(position=position_jitter(0.2), size = 0.5) +
+  labs(x = 'Ludwig fibrosis stage',
+       y = 'Baseline values',
+       title = biomarker) +
+  # scale_y_continuous(trans = 'log10') +
+  theme_classic()+
+  theme(legend.position = 'none', 
+        plot.title = element_text(hjust = 0.5, face = 'bold'),
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 12)) 
+
+```
+
+<br>
+
+## Serum bile acids (BAs)
+
+```{r}
+## Composition of individual BAs
+
+df_BA_total <- adbk_BL %>%
+  filter(PARAMCD == 'METATBA') %>%
+  select(USUBJID, TRT01A, AVAL) %>%
+  rename(TotalBA = AVAL)
+
+df_BA_summary <- adbk_BL %>%
+  filter(PARAMCD %in% unlist(BA[1:4])) %>%
+  mutate(PARAMCD = factor(PARAMCD, levels = rev(unlist(BA[1:4])), ordered = TRUE)) %>%
+  select(USUBJID, TRT01A, AGE, SEX, BBMI, IBD, BUDCA, BLUDWIG, BLUDWIG_CAT, PARAMCD, AVAL) %>%
+  left_join(df_BA_total) %>%
+  mutate(PCT = round(AVAL/TotalBA*100, digits = 1)) %>%
+  group_by(PARAMCD, BUDCA) %>%
+  summarise(median = median(PCT, na.rm = TRUE),
+                 Q1 = quantile(PCT, probs = 0.25, na.rm = TRUE),
+                 Q3 = quantile(PCT, probs = 0.75, na.rm = TRUE)) %>%
+  mutate(GROUP = ifelse(PARAMCD %in% BA$Primary, 'Unconj. Primary', 
+                        ifelse(PARAMCD %in% BA$`Conjugated Primary`, 'Conj. Primary', 
+                               ifelse(PARAMCD %in% BA$Secondary, 'Unconj. Secondary', 'Conj. Secondary')))) %>%
+  mutate(GROUP = factor(GROUP, levels = c('Unconj. Primary', 'Conj. Primary', 'Unconj. Secondary', 'Conj. Secondary'),
+                        ordered = TRUE))
+
+ggplot(df_BA_summary, aes(x = PARAMCD, y = median, fill = GROUP)) +
+  geom_bar(position = position_dodge(), stat = 'identity',
+           width = 0.8,
+           color = 'black') +
+  geom_errorbar(aes(ymin = Q1, ymax = Q3),
+                width = .2,
+                position = position_dodge())+
+  scale_fill_brewer(palette = 'Paired') + 
+  facet_wrap(~BUDCA, labeller = label_both) +
+  ylim(c(0,60)) +
+  labs(y = 'Serum Bile Acid Composition (%)',
+       x = NULL) +
+  coord_flip() +
+  theme_bw() +  
+  theme(legend.position = 'right', legend.title = element_blank())
+
+```
+
+- Conjugated primary BAs (especially GCA and GCDCA) comprise the majority of BA pool
+
+- UDCA (and its conjugates) are substantially increased by UDCA use; therefore, their concentrations are deducted from total BA or secondary BA in the following analysis
+
+<br>
+
+```{r, fig.width=6, fig.height=8}
+df_BA <- adbk_BL %>%
+  filter(PARAMCD %in% unlist(BA[-5])) %>%
+  mutate(PARAMCD = factor(PARAMCD, ordered = T, levels = rev(unlist(BA[-5]))))
+
+ggplot(df_BA, aes(x = PARAMCD, y = AVAL)) +
+  geom_boxplot(aes(fill = BLUDWIG_CAT), outlier.shape = NA, width = 0.6) +
+  scale_fill_brewer(palette = 'Paired') +
+  labs(x = element_blank(),
+       y = 'Baseline concentration, ng/mL',
+       fill = 'Baseline Ludwig') +
+  scale_y_continuous(trans = 'log10') +
+  theme_bw()+
+  facet_wrap(~BUDCA, labeller = label_both) +
+  theme(legend.position = 'bottom', 
+        plot.title = element_text(hjust = 0.5, face = 'bold'),
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 11)) +
+  coord_flip() 
+
+```
+
+- Conj. primary BAs were elevated in F3 vs. F0-2 patients
+
+- LCA and its conjugates were elevated in patients using UDCA
+
+<br>
+
+## Within F3 patients, imbalanced baseline liver biochemistry and conj. primary BAs were observed between treatment arms
+
+Note that changes from baseline to week 96 in liver enzymes, bile acids are one of the secondary endpoints.
+
+```{r, fig.width=10, fig.height=4}
+df_plot <- df %>%
+  filter(BLUDWIG_CAT == 'F3') %>%
+  filter(PARAMCD %in% c('ALP', 'ALT', 'AST', 'GGT', 
+                        'GCA', 'TCA', 'GCDCA', 'TCDCA')) %>%
+  mutate(PARAMCD = factor(PARAMCD, levels = c('ALP', 'ALT', 'AST', 'GGT', 
+                                              'GCA', 'TCA', 'GCDCA', 'TCDCA'),
+                          ordered = TRUE)) %>%
+  distinct()
+
+p <- ggboxplot(df_plot,
+          x = 'TRT01A',
+          y = 'AVAL',
+          yscale = 'log10',
+          xlab = FALSE, ylab = 'Baseline values',
+          fill = 'TRT01A', 
+          palette = c('grey', 'orange'),
+          ggtheme = theme_classic(),
+          outlier.shape = 18,
+          facet.by = c('PARAMCD'), ncol = 4,
+          scales = 'free_y') +
+  stat_compare_means(aes(label = ..p.signif..), 
+                     method = 'wilcox.test',
+                     label.y.npc = 'bottom', label.x.npc = 'center') 
+
+ggpar(p,
+      title = 'F3 patients',
+      legend.title = 'Treatment arm')
+
+
+```
+
+<br>
+
+## Characteristics comparison between the participants used for futility analysis and the others
+
+The PRIMIS study was early terminated based on a pre-planned, interim futility analysis was performed after 160 participants had either completed week 96 or an early termination visit. 
+
+After comparison, we did not observe significant differences in patients by whether they were used in futility analysis.
+
+```{r}
+df <- adbk_BL %>%
+  select(USUBJID, TRT01A, RACE, AGE, SEX, BBMI, IBD, BUDCA, BLUDWIG, BLUDWIG_CAT, FUTILFL, PARAMCD, AVAL) %>%
+  distinct() %>%
+  pivot_wider(names_from = PARAMCD, values_from = 'AVAL')
+
+print(table(df$FUTILFL))
+
+## Change attributes for table presentation
+df[] <- lapply(df, function(x) { attr(x, 'label') <- NULL; x })
+attr(df$TBMUDCA, 'label') <- 'Total BA'
+attr(df$PRMTBA, 'label') <- 'Primary BA'
+attr(df$SBMUDCA, 'label') <- 'Secondary BA'
+
+## Compare demographics
+demog <- c('TRT01A', 'AGE', 'SEX', 'BBMI', 'BLUDWIG', 'BUDCA', 'IBD')
+tbl_summary(select(df, FUTILFL, all_of(demog)), 
+                   by = FUTILFL, missing = 'no') %>%
+  add_n() %>%
+  add_p() %>%
+  bold_labels() %>%
+  modify_caption('**Patients who participated in fultility analysis vs. who did not**')
+
+## Compare baseline values of biomarkers
+biomarkers <- c(PD, liver_biochemistry, inflammation, NIT_fibrosis[1:4], BA$Total[-1])
+tbl_summary(select(df, FUTILFL, all_of(biomarkers)), 
+                   by = FUTILFL, missing = 'no') %>%
+  add_n() %>%
+  add_p() %>%
+  bold_labels() %>%
+  modify_caption('**Patients who participated in fultility analysis vs. who did not**')
+
+
+```
+
+<br>
+<br>
+
+# Pharmacodynamic effect of CILO
+
+```{r}
+df_chg <- adbk %>%
+  filter(AVISITN <= 96) %>%
+  select(USUBJID, TRT01A, AVISIT, AVISITN, FUTILFL,
+         BLUDWIG, BLUDWIG_CAT, BUDCA, IBD, AGE, SEX,
+         PARAM, PARAMCD, AVAL, CHG, PCHG, BASE,
+         ANRHI, R2ANRHI, LLOQ, LLOQFL) %>%
+  mutate(AVISIT = factor(AVISIT, levels = c('Baseline', 'Week 4', 'Week 8',
+                                             'Week 12', 'Week 24', 'Week 36',
+                                             'Week 48', 'Week 60', 'Week 72',
+                                             'Week 84', 'Week 96'), ordered = T)) %>%
+  mutate(TRT01A = relevel(factor(TRT01A, ordered = F), ref = 'Placebo')) %>%
+  mutate(AVALlog = log2(AVAL))
+
+```
+
+
+## Linear mixed effect model for treatment effect
+
+The model we used for evaluating treatment effect is as below:
+
+*AVAL ~ TRT\*(VISIT + BLUDWIG) + BUDCA + AGE + SEX + (1|USUBJID)*
+
+where *BLUDWIG* is the baseline Ludwig fibrosis stage (F3 vs. F0-2), *BUDCA* is the baseline UDCA use. The dependent variable *AVAL* is the log-transformed values of biomarkers (exception: we used original values for ELF score).
+
+```{r}
+## Because the collection timepoints differ for different biomarkers, the function for calculating contrasts needs to adapt accordingly.
+## Here we use the PD biomarkers (C7, FGF19) as examples, which were collected at baseline, week 12, 24, 48, 72, and 96.
+getContrasts_PD <- function(lsmeans_obj){
+  
+  ctr <- contrast(lsmeans_obj, list(
+    W12 = c(1, -1, -1, 1, rep(0, length = 8)),
+    W24 = c(1, -1, rep(0, length = 2), -1, 1, rep(0, length = 6)),
+    W48 = c(1, -1, rep(0, length = 4), -1, 1, rep(0, length = 4)),
+    W72 = c(1, -1, rep(0, length = 6), -1, 1, rep(0, length = 2)),
+    W96 = c(1, -1, rep(0, length = 8), -1, 1)
+  )
+  )
+  
+  return(data.frame(ctr))
+  
+}
+
+bmk = PD
+contrasts <- vector('list', length = length(bmk))
+names(contrasts) <- bmk
+
+for(i in bmk){
+  
+  df <- df_chg %>%
+    filter(PARAMCD == i) %>%
+    filter(LLOQFL != 'Y')
+  
+  model = lmerTest::lmer(AVALlog ~ TRT01A*(AVISIT + BLUDWIG_CAT) + BUDCA + 
+                           (1|USUBJID) + AGE + SEX,
+                         data = df, REML = FALSE)
+  
+  res <- lsmeans(model, specs = c('TRT01A', 'AVISIT'))
+  contrasts[[i]] <- getContrasts_PD(res)
+   
+}
+
+contrasts_PD = bind_rows(contrasts, .id = 'PARAMCD')
+print(contrasts_PD)
+
+```
+
+<br>
+
+## Line plots for longitudinal changes of biomarkers
+
+We used line plots to illustrate either values or %change from baseline of biomarkers across time points. For liver biochemistry (e.g. ALP, ALT, GGT), we used ratios to the upper limit of normal (ULN) to represent the values. For ELF score, we used change rather than %change from baseline.
+
+In subgroup analysis, we will baseline Ludwig fibrosis stage and UDCA use as the grouping factors.
+
+```{r}
+## Summarize by median and IQR
+df_chg$PCHG[which(df_chg$AVISIT == 'Baseline')] <- 0
+
+df_summary <- df_chg %>%
+  # group_by(PARAMCD, AVISITN, TRT01A) %>%    # if no subgrouping is needed
+  group_by(PARAMCD, AVISITN, TRT01A, BLUDWIG_CAT, BUDCA) %>%
+  summarise(
+    ## Actual values
+    # median = median(AVAL, na.rm = TRUE),
+    # Q1 = quantile(AVAL, probs = 0.25, na.rm = TRUE),
+    # Q3 = quantile(AVAL, probs = 0.75, na.rm = TRUE)
+    
+    ## Ratio to ULN
+    median = median(R2ANRHI, na.rm = TRUE),
+    Q1 = quantile(R2ANRHI, probs = 0.25, na.rm = TRUE),
+    Q3 = quantile(R2ANRHI, probs = 0.75, na.rm = TRUE)
+    
+    ## %Change from baseline
+    # median = median(PCHG, na.rm = TRUE),
+    # Q1 = quantile(PCHG, probs = 0.25, na.rm = TRUE),
+    # Q3 = quantile(PCHG, probs = 0.75, na.rm = TRUE)
+
+  ) %>%
+  drop_na(median) %>%
+  rename(Ludwig = BLUDWIG_CAT, UDCA = BUDCA)
+
+
+biomarker = 'GGT' 
+
+ggplot(df_summary[which(df_summary$PARAMCD == biomarker),], 
+       aes(x = AVISITN, y = median,
+           group = TRT01A,
+           color = TRT01A)) +
+  scale_color_manual(values = c('grey50', 'orange')) +
+  geom_point(position = position_dodge(3),
+             size = 1.5)+
+  geom_errorbar(aes(ymin = Q1, ymax = Q3),
+                size = .7,
+                width = 0,
+                position = position_dodge(3)) +
+  geom_hline(yintercept = 1, color = 'black', linetype = 'dotted') +
+  geom_line(position = position_dodge(3)) +
+  facet_grid(UDCA ~ Ludwig, labeller = label_both)+
+  labs(x = 'Weeks', 
+       y = 'x ULN \nMedian, IQR',
+       title = biomarker) +
+  theme_bw() +
+  scale_x_continuous(breaks=c(0, 4, 8, 12, 24, 36, 48, 60, 72, 84, 96)) +
+  theme(legend.position = 'bottom', 
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        strip.text = element_text(size = 11),
+        plot.title = element_text(hjust = 0.5, face = 'bold'),
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 11))
+
+```
+
+
+```{r}
+sessionInfo()
+```
+
